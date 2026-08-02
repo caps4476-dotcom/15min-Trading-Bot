@@ -40,7 +40,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # Welche Symbole und Timeframes sollen geprüft werden?
-SYMBOLS = ["BTCUSDT"]
+SYMBOLS = ["BTCUSDT", "PAXGUSDT", "EURUSDT"]  # PAXGUSDT = Gold, EURUSDT = EUR/USD
 TIMEFRAMES = ["15m", "5m"]
 
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"

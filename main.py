@@ -1,9 +1,19 @@
 """
-M15 Signal Bot – BTCUSDT
-=========================
-Analysiert fortlaufend abgeschlossene 15-Minuten-Kerzen von Binance
-(EMA200, Bollinger Bänder 20/2.0, RSI14) und sendet bei einem validen
-Setup (Trend + Re-Test am Bollinger Band) eine Telegram-Push-Nachricht.
+M15/M5 Signal Bot – BTCUSDT
+============================
+Analysiert fortlaufend abgeschlossene Kerzen von Binance auf mehreren
+Timeframes (EMA200, Bollinger Bänder 20/2.0, RSI14) und sendet bei
+einem validen Setup eine Telegram-Push-Nachricht.
+
+Es werden ZWEI Signal-Typen erkannt:
+
+1. RE-TEST (Trendfortsetzung nach Rücksetzer):
+   Kurs berührt ein Band, schließt aber wieder INNERHALB der Bänder
+   zurück (Ablehnung/Bounce) – im Trend des EMA200.
+
+2. BREAKOUT (Ausbruch mit Trendbestätigung):
+   Kurs bricht durch ein Band und schließt AUSSERHALB davon (bleibt
+   dort) – im Trend des EMA200, mit starkem RSI.
 
 Es wird bewusst NUR die letzte ABGESCHLOSSENE Kerze (iloc[-2]) bewertet,
 da die aktuelle Kerze (iloc[-1]) noch läuft und sich verändern kann.
@@ -29,8 +39,10 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SYMBOL = "BTCUSDT"
-INTERVAL = "15m"
+# Welche Symbole und Timeframes sollen geprüft werden?
+SYMBOLS = ["BTCUSDT"]
+TIMEFRAMES = ["15m", "5m"]
+
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 CANDLE_LIMIT = 300  # genug Historie für EMA200
 
@@ -41,6 +53,11 @@ RSI_PERIOD = 14
 
 SL_BUFFER = 15.0    # $ Puffer über/unter der Signal-Kerze für den Stop Loss
 CRV = 1.5           # Chance-Risiko-Verhältnis für den Take Profit
+
+RSI_RETEST_HIGH = 60   # Re-Test SELL: RSI muss mindestens so hoch sein
+RSI_RETEST_LOW = 40    # Re-Test BUY: RSI muss höchstens so niedrig sein
+RSI_BREAKOUT_HIGH = 60  # Breakout BUY: RSI muss mindestens so hoch sein
+RSI_BREAKOUT_LOW = 40   # Breakout SELL: RSI muss höchstens so niedrig sein
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_signal.json")
 RETRY_SLEEP_SECONDS = 60  # Wartezeit nach einem Fehler, bevor erneut versucht wird
@@ -56,7 +73,7 @@ logger = logging.getLogger("m15_signal_bot")
 # Daten & Indikatoren
 # ---------------------------------------------------------------------------
 
-def fetch_klines(symbol: str = SYMBOL, interval: str = INTERVAL, limit: int = CANDLE_LIMIT) -> pd.DataFrame:
+def fetch_klines(symbol: str, interval: str, limit: int = CANDLE_LIMIT) -> pd.DataFrame:
     """Holt die letzten Kerzen von der öffentlichen Binance-REST-API."""
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     resp = requests.get(BINANCE_KLINES_URL, params=params, timeout=15)
@@ -79,17 +96,14 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Berechnet EMA200, Bollinger Bänder (20, 2.0) und RSI(14)."""
     df = df.copy()
 
-    # EMA 200
     df["ema200"] = df["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
 
-    # Bollinger Bänder
     sma = df["close"].rolling(BB_LENGTH).mean()
     std = df["close"].rolling(BB_LENGTH).std(ddof=0)
     df["bb_mid"] = sma
     df["bb_upper"] = sma + BB_STD * std
     df["bb_lower"] = sma - BB_STD * std
 
-    # RSI (Wilder-Glättung via EWM)
     delta = df["close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -103,24 +117,38 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Signal-Logik
+# Hilfsfunktion für SL/TP
 # ---------------------------------------------------------------------------
 
-def check_signal(df: pd.DataFrame):
-    """Prüft ausschließlich die letzte ABGESCHLOSSENE Kerze (iloc[-2])."""
+def build_signal(signal_type: str, category: str, entry: float, sl: float, rsi: float, candle_time) -> dict:
+    if signal_type == "SELL":
+        risk = sl - entry
+        tp = entry - risk * CRV
+    else:
+        risk = entry - sl
+        tp = entry + risk * CRV
+    return {
+        "type": signal_type,
+        "category": category,  # "RETEST" oder "BREAKOUT"
+        "entry": entry,
+        "sl": sl,
+        "tp": tp,
+        "rsi": rsi,
+        "candle_time": candle_time,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Signal-Logik: RE-TEST (Rücksetzer/Ablehnung am Band, zurück in den Bändern)
+# ---------------------------------------------------------------------------
+
+def check_retest_signal(df: pd.DataFrame):
     if len(df) < EMA_PERIOD + 5:
         return None
 
     candle = df.iloc[-2]
-
-    close = candle["close"]
-    open_ = candle["open"]
-    high = candle["high"]
-    low = candle["low"]
-    ema200 = candle["ema200"]
-    bb_upper = candle["bb_upper"]
-    bb_lower = candle["bb_lower"]
-    rsi = candle["rsi"]
+    close, open_, high, low = candle["close"], candle["open"], candle["high"], candle["low"]
+    ema200, bb_upper, bb_lower, rsi = candle["ema200"], candle["bb_upper"], candle["bb_lower"], candle["rsi"]
 
     if any(pd.isna(x) for x in [ema200, bb_upper, bb_lower, rsi]):
         return None
@@ -128,45 +156,63 @@ def check_signal(df: pd.DataFrame):
     is_red = close < open_
     is_green = close > open_
 
-    # --- SELL: Abwärtstrend & Re-Test am oberen Band ---
-    if (
-        close < ema200
-        and high >= bb_upper
-        and close < bb_upper
-        and is_red
-        and rsi >= 60
-    ):
+    # SELL: Abwärtstrend, Hoch berührt oberes Band, schließt wieder darunter (Ablehnung)
+    if close < ema200 and high >= bb_upper and close < bb_upper and is_red and rsi >= RSI_RETEST_HIGH:
         sl = high + SL_BUFFER
-        risk = sl - close
-        tp = close - risk * CRV
-        return {
-            "type": "SELL",
-            "entry": close,
-            "sl": sl,
-            "tp": tp,
-            "rsi": rsi,
-            "candle_time": candle["close_time"],
-        }
+        return build_signal("SELL", "RETEST", close, sl, rsi, candle["close_time"])
 
-    # --- BUY: Aufwärtstrend & Re-Test am unteren Band ---
+    # BUY: Aufwärtstrend, Tief berührt unteres Band, schließt wieder darüber (Bounce)
+    if close > ema200 and low <= bb_lower and close > bb_lower and is_green and rsi <= RSI_RETEST_LOW:
+        sl = low - SL_BUFFER
+        return build_signal("BUY", "RETEST", close, sl, rsi, candle["close_time"])
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Signal-Logik: BREAKOUT (Ausbruch mit Trendbestätigung, bleibt außerhalb)
+# ---------------------------------------------------------------------------
+
+def check_breakout_signal(df: pd.DataFrame):
+    if len(df) < EMA_PERIOD + 5:
+        return None
+
+    candle = df.iloc[-2]
+    prev = df.iloc[-3]
+
+    close, open_ = candle["close"], candle["open"]
+    ema200, bb_upper, bb_lower, rsi = candle["ema200"], candle["bb_upper"], candle["bb_lower"], candle["rsi"]
+    prev_close = prev["close"]
+
+    if any(pd.isna(x) for x in [ema200, bb_upper, bb_lower, rsi, prev_close]):
+        return None
+
+    is_red = close < open_
+    is_green = close > open_
+
+    # BUY-Breakout: Aufwärtstrend, Kerze bricht NEU über das obere Band und bleibt dort,
+    # RSI bleibt stark (hoch), grüne Kerze.
     if (
         close > ema200
-        and low <= bb_lower
-        and close > bb_lower
+        and prev_close <= bb_upper
+        and close > bb_upper
         and is_green
-        and rsi <= 40
+        and rsi >= RSI_BREAKOUT_HIGH
     ):
-        sl = low - SL_BUFFER
-        risk = close - sl
-        tp = close + risk * CRV
-        return {
-            "type": "BUY",
-            "entry": close,
-            "sl": sl,
-            "tp": tp,
-            "rsi": rsi,
-            "candle_time": candle["close_time"],
-        }
+        sl = close - SL_BUFFER * 2  # weiterer Puffer, da Breakouts volatiler sind
+        return build_signal("BUY", "BREAKOUT", close, sl, rsi, candle["close_time"])
+
+    # SELL-Breakout: Abwärtstrend, Kerze bricht NEU unter das untere Band und bleibt dort,
+    # RSI bleibt schwach (niedrig), rote Kerze.
+    if (
+        close < ema200
+        and prev_close >= bb_lower
+        and close < bb_lower
+        and is_red
+        and rsi <= RSI_BREAKOUT_LOW
+    ):
+        sl = close + SL_BUFFER * 2
+        return build_signal("SELL", "BREAKOUT", close, sl, rsi, candle["close_time"])
 
     return None
 
@@ -175,30 +221,35 @@ def check_signal(df: pd.DataFrame):
 # Duplikat-Schutz (State-Datei)
 # ---------------------------------------------------------------------------
 
-def load_last_signal_time():
+def load_state() -> dict:
     if not os.path.exists(STATE_FILE):
-        return None
+        return {}
     try:
         with open(STATE_FILE, "r") as f:
-            data = json.load(f)
-        return data.get("last_candle_time")
+            return json.load(f)
     except (json.JSONDecodeError, OSError):
-        return None
+        return {}
 
 
-def save_last_signal_time(candle_time_str: str):
+def save_state(state: dict):
     with open(STATE_FILE, "w") as f:
-        json.dump({"last_candle_time": candle_time_str}, f)
+        json.dump(state, f)
 
 
 # ---------------------------------------------------------------------------
 # Telegram
 # ---------------------------------------------------------------------------
 
-def format_signal_message(signal: dict) -> str:
-    reason = "Abprall am Bollinger Band im Trend des EMA 200"
+def format_signal_message(symbol: str, interval: str, signal: dict) -> str:
+    category_label = "Re-Test" if signal["category"] == "RETEST" else "Breakout"
+    if signal["category"] == "RETEST":
+        reason = "Abprall/Ablehnung am Bollinger Band im Trend des EMA 200"
+    else:
+        reason = "Ausbruch durchs Bollinger Band mit Trendbestätigung (EMA 200 + starker RSI)"
+
+    display_symbol = symbol.replace("USDT", "USD")
     return (
-        f"🚨 *M15 SIGNAL {signal['type']} - BTCUSD* 🚨\n\n"
+        f"🚨 *{interval.upper()} SIGNAL {signal['type']} ({category_label}) - {display_symbol}* 🚨\n\n"
         f"- *Einstieg:* {signal['entry']:.2f} $\n"
         f"- *Stop Loss (SL):* {signal['sl']:.2f} $\n"
         f"- *Take Profit (TP):* {signal['tp']:.2f} $\n"
@@ -232,47 +283,71 @@ def send_telegram_message(text: str) -> bool:
 # Ablaufsteuerung
 # ---------------------------------------------------------------------------
 
+def process_symbol_timeframe(symbol: str, interval: str, state: dict) -> bool:
+    """Prüft ein Symbol/Timeframe auf beide Signal-Typen. Gibt True zurück, wenn der State geändert wurde."""
+    state_changed = False
+    try:
+        df = fetch_klines(symbol, interval)
+        df = calculate_indicators(df)
+    except requests.RequestException as e:
+        logger.error(f"Netzwerkfehler beim Abruf von {symbol} {interval}: {e}")
+        return False
+
+    signals = [s for s in (check_retest_signal(df), check_breakout_signal(df)) if s is not None]
+
+    if not signals:
+        logger.info(f"{symbol} {interval}: keine Signal-Bedingung erfüllt.")
+        return False
+
+    for signal in signals:
+        state_key = f"{symbol}_{interval}_{signal['category']}"
+        candle_time_str = str(signal["candle_time"])
+
+        if state.get(state_key) == candle_time_str:
+            logger.info(f"{symbol} {interval} {signal['category']}: bereits gesendet – überspringe.")
+            continue
+
+        message = format_signal_message(symbol, interval, signal)
+        if send_telegram_message(message):
+            state[state_key] = candle_time_str
+            state_changed = True
+            logger.info(f"Signal gesendet: {symbol} {interval} {signal['category']} {signal['type']} @ {signal['entry']:.2f}")
+        else:
+            logger.warning(f"Signal erkannt ({symbol} {interval} {signal['category']}), aber Telegram-Versand fehlgeschlagen.")
+
+    return state_changed
+
+
 def run_check():
-    df = fetch_klines()
-    df = calculate_indicators(df)
-    signal = check_signal(df)
+    state = load_state()
+    state_changed = False
 
-    if signal is None:
-        logger.info("Keine Signal-Bedingung erfüllt.")
-        return
+    for symbol in SYMBOLS:
+        for interval in TIMEFRAMES:
+            if process_symbol_timeframe(symbol, interval, state):
+                state_changed = True
 
-    candle_time_str = str(signal["candle_time"])
-    last_sent = load_last_signal_time()
-
-    if last_sent == candle_time_str:
-        logger.info("Signal für diese Kerze wurde bereits gesendet – überspringe (Duplikat-Schutz).")
-        return
-
-    message = format_signal_message(signal)
-    if send_telegram_message(message):
-        save_last_signal_time(candle_time_str)
-        logger.info(f"Signal gesendet: {signal['type']} @ {signal['entry']:.2f}")
-    else:
-        logger.warning("Signal erkannt, aber Telegram-Versand ist fehlgeschlagen (State nicht gespeichert).")
+    if state_changed:
+        save_state(state)
 
 
 def seconds_until_next_check() -> float:
-    """Berechnet die Wartezeit bis kurz nach dem Schluss der nächsten 15-Minuten-Kerze."""
+    """Berechnet die Wartezeit bis kurz nach dem Schluss der nächsten 5-Minuten-Kerze
+    (deckt damit automatisch auch jeden 15-Minuten-Kerzenschluss mit ab)."""
     now = datetime.now(timezone.utc)
-    next_slot_minute = ((now.minute // 15) + 1) * 15
+    next_slot_minute = ((now.minute // 5) + 1) * 5
 
     if next_slot_minute >= 60:
         next_dt = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     else:
         next_dt = now.replace(minute=next_slot_minute, second=0, microsecond=0)
 
-    # Sicherheitspuffer, damit die Binance-Kerze garantiert schon geschlossen ist
-    next_dt += timedelta(seconds=20)
+    next_dt += timedelta(seconds=10)
     return max((next_dt - now).total_seconds(), 5)
 
 
 def main():
-    logger.info(f"M15 Signal Bot gestartet für {SYMBOL} ({INTERVAL}).")
+    logger.info(f"Signal Bot gestartet für {SYMBOLS} auf {TIMEFRAMES}.")
     while True:
         try:
             run_check()
@@ -281,7 +356,6 @@ def main():
             logger.error(f"Netzwerkfehler: {e} – neuer Versuch in {RETRY_SLEEP_SECONDS}s.")
             sleep_seconds = RETRY_SLEEP_SECONDS
         except Exception as e:
-            # Fängt alles Unerwartete ab, damit der Bot niemals abstürzt.
             logger.exception(f"Unerwarteter Fehler: {e} – neuer Versuch in {RETRY_SLEEP_SECONDS}s.")
             sleep_seconds = RETRY_SLEEP_SECONDS
 

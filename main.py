@@ -58,7 +58,7 @@ BB_LENGTH = 20
 BB_STD = 2.0
 RSI_PERIOD = 14
 
-SL_BUFFER = 15.0    # $ Puffer über/unter der Signal-Kerze für den Stop Loss
+SL_BUFFER_PCT = 0.001   # 0.1% des Kurses Puffer für Re-Test (skaliert automatisch mit dem Preisniveau)
 CRV = 1.5           # Chance-Risiko-Verhältnis für den Take Profit
 
 RSI_RETEST_HIGH = 60   # Re-Test SELL: RSI muss mindestens so hoch sein
@@ -180,12 +180,12 @@ def check_retest_signal(df: pd.DataFrame):
 
     # SELL: Abwärtstrend, Hoch berührt oberes Band, schließt wieder darunter (Ablehnung)
     if close < ema200 and high >= bb_upper and close < bb_upper and is_red and rsi >= RSI_RETEST_HIGH:
-        sl = high + SL_BUFFER
+        sl = high + high * SL_BUFFER_PCT
         return build_signal("SELL", "RETEST", close, sl, rsi, candle["close_time"])
 
     # BUY: Aufwärtstrend, Tief berührt unteres Band, schließt wieder darüber (Bounce)
     if close > ema200 and low <= bb_lower and close > bb_lower and is_green and rsi <= RSI_RETEST_LOW:
-        sl = low - SL_BUFFER
+        sl = low - low * SL_BUFFER_PCT
         return build_signal("BUY", "RETEST", close, sl, rsi, candle["close_time"])
 
     return None
@@ -231,7 +231,7 @@ def check_breakout_signal(df: pd.DataFrame):
                 df.iloc[k]["rsi"] >= RSI_BREAKOUT_HIGH for k in range(breakout_start, current_pos)
             )
             if not rsi_already_confirmed and rsi >= RSI_BREAKOUT_HIGH:
-                sl = close - SL_BUFFER * 2  # weiterer Puffer, da Breakouts volatiler sind
+                sl = close - close * SL_BUFFER_PCT * 2  # weiterer Puffer, da Breakouts volatiler sind
                 return build_signal("BUY", "BREAKOUT", close, sl, rsi, candle["close_time"])
 
     # --- SELL-Breakout: Kurs liegt (seit kurzem) unter dem unteren Band, im Abwärtstrend ---
@@ -244,7 +244,7 @@ def check_breakout_signal(df: pd.DataFrame):
                 df.iloc[k]["rsi"] <= RSI_BREAKOUT_LOW for k in range(breakout_start, current_pos)
             )
             if not rsi_already_confirmed and rsi <= RSI_BREAKOUT_LOW:
-                sl = close + SL_BUFFER * 2
+                sl = close + close * SL_BUFFER_PCT * 2
                 return build_signal("SELL", "BREAKOUT", close, sl, rsi, candle["close_time"])
 
     return None
@@ -355,6 +355,17 @@ def check_open_trades_for_symbol(symbol: str, interval: str, df: pd.DataFrame, o
 # Telegram
 # ---------------------------------------------------------------------------
 
+def _decimals_for_price(price: float) -> int:
+    """Wählt eine sinnvolle Anzahl Nachkommastellen je nach Preisniveau –
+    bei EUR/USD (~1$) braucht es mehr Nachkommastellen als bei BTC (~60.000$),
+    sonst sehen SL und TP in der Nachricht identisch aus."""
+    if price < 10:
+        return 5
+    if price < 1000:
+        return 3
+    return 2
+
+
 def format_signal_message(symbol: str, interval: str, signal: dict) -> str:
     category_label = "Re-Test" if signal["category"] == "RETEST" else "Breakout"
     if signal["category"] == "RETEST":
@@ -363,11 +374,12 @@ def format_signal_message(symbol: str, interval: str, signal: dict) -> str:
         reason = "Ausbruch durchs Bollinger Band mit Trendbestätigung (EMA 200 + starker RSI)"
 
     display_symbol = symbol.replace("USDT", "USD")
+    d = _decimals_for_price(signal["entry"])
     return (
         f"🚨 *{interval.upper()} SIGNAL {signal['type']} ({category_label}) - {display_symbol}* 🚨\n\n"
-        f"- *Einstieg:* {signal['entry']:.2f} $\n"
-        f"- *Stop Loss (SL):* {signal['sl']:.2f} $\n"
-        f"- *Take Profit (TP):* {signal['tp']:.2f} $\n"
+        f"- *Einstieg:* {signal['entry']:.{d}f} $\n"
+        f"- *Stop Loss (SL):* {signal['sl']:.{d}f} $\n"
+        f"- *Take Profit (TP):* {signal['tp']:.{d}f} $\n"
         f"- *CRV:* 1:{CRV}\n"
         f"- *RSI:* {signal['rsi']:.2f}\n"
         f"- *Grund:* {reason}"
@@ -377,6 +389,7 @@ def format_signal_message(symbol: str, interval: str, signal: dict) -> str:
 def format_outcome_message(trade: dict, outcome: str, exit_price: float) -> str:
     display_symbol = trade["symbol"].replace("USDT", "USD")
     category_label = "Re-Test" if trade["category"] == "RETEST" else "Breakout"
+    d = _decimals_for_price(trade["entry"])
 
     if outcome == "TP":
         emoji = "✅"
@@ -389,9 +402,9 @@ def format_outcome_message(trade: dict, outcome: str, exit_price: float) -> str:
 
     return (
         f"{emoji} *{title} - {trade['interval'].upper()} {trade['type']} ({category_label}) - {display_symbol}* {emoji}\n\n"
-        f"- *Einstieg:* {trade['entry']:.2f} $\n"
-        f"- *Ausstieg:* {exit_price:.2f} $\n"
-        f"- *Ergebnis:* {'+' if pnl >= 0 else ''}{pnl:.2f} $"
+        f"- *Einstieg:* {trade['entry']:.{d}f} $\n"
+        f"- *Ausstieg:* {exit_price:.{d}f} $\n"
+        f"- *Ergebnis:* {'+' if pnl >= 0 else ''}{pnl:.{d}f} $"
     )
 
 

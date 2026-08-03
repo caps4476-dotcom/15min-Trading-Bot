@@ -58,6 +58,7 @@ RSI_RETEST_HIGH = 60   # Re-Test SELL: RSI muss mindestens so hoch sein
 RSI_RETEST_LOW = 40    # Re-Test BUY: RSI muss höchstens so niedrig sein
 RSI_BREAKOUT_HIGH = 60  # Breakout BUY: RSI muss mindestens so hoch sein
 RSI_BREAKOUT_LOW = 40   # Breakout SELL: RSI muss höchstens so niedrig sein
+BREAKOUT_LOOKBACK = 5   # Wie viele Kerzen nach dem eigentlichen Ausbruch die RSI-Bestätigung noch zählt
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_signal.json")
 RETRY_SLEEP_SECONDS = 60  # Wartezeit nach einem Fehler, bevor erneut versucht wird
@@ -173,46 +174,58 @@ def check_retest_signal(df: pd.DataFrame):
 # Signal-Logik: BREAKOUT (Ausbruch mit Trendbestätigung, bleibt außerhalb)
 # ---------------------------------------------------------------------------
 
+def _find_breakout_start(df: pd.DataFrame, current_pos: int, band_col: str, is_outside) -> int:
+    """Läuft von der aktuellen Kerze rückwärts, solange der Kurs durchgehend außerhalb
+    des Bandes liegt, und gibt die Position der ERSTEN Kerze dieses Ausbruchs zurück."""
+    pos = current_pos
+    while pos > 0 and is_outside(df.iloc[pos - 1]["close"], df.iloc[pos - 1][band_col]):
+        pos -= 1
+    return pos
+
+
 def check_breakout_signal(df: pd.DataFrame):
-    if len(df) < EMA_PERIOD + 5:
+    if len(df) < EMA_PERIOD + BREAKOUT_LOOKBACK + 2:
         return None
 
-    candle = df.iloc[-2]
-    prev = df.iloc[-3]
+    current_pos = len(df) - 2  # Position von iloc[-2]
+    candle = df.iloc[current_pos]
 
     close, open_ = candle["close"], candle["open"]
     ema200, bb_upper, bb_lower, rsi = candle["ema200"], candle["bb_upper"], candle["bb_lower"], candle["rsi"]
-    prev_close = prev["close"]
 
-    if any(pd.isna(x) for x in [ema200, bb_upper, bb_lower, rsi, prev_close]):
+    if any(pd.isna(x) for x in [ema200, bb_upper, bb_lower, rsi]):
         return None
 
     is_red = close < open_
     is_green = close > open_
 
-    # BUY-Breakout: Aufwärtstrend, Kerze bricht NEU über das obere Band und bleibt dort,
-    # RSI bleibt stark (hoch), grüne Kerze.
-    if (
-        close > ema200
-        and prev_close <= bb_upper
-        and close > bb_upper
-        and is_green
-        and rsi >= RSI_BREAKOUT_HIGH
-    ):
-        sl = close - SL_BUFFER * 2  # weiterer Puffer, da Breakouts volatiler sind
-        return build_signal("BUY", "BREAKOUT", close, sl, rsi, candle["close_time"])
+    # --- BUY-Breakout: Kurs liegt (seit kurzem) über dem oberen Band, im Aufwärtstrend ---
+    if close > ema200 and close > bb_upper and is_green:
+        breakout_start = _find_breakout_start(df, current_pos, "bb_upper", lambda c, b: c > b)
+        duration = current_pos - breakout_start  # 0 = genau die Ausbruchskerze selbst
 
-    # SELL-Breakout: Abwärtstrend, Kerze bricht NEU unter das untere Band und bleibt dort,
-    # RSI bleibt schwach (niedrig), rote Kerze.
-    if (
-        close < ema200
-        and prev_close >= bb_lower
-        and close < bb_lower
-        and is_red
-        and rsi <= RSI_BREAKOUT_LOW
-    ):
-        sl = close + SL_BUFFER * 2
-        return build_signal("SELL", "BREAKOUT", close, sl, rsi, candle["close_time"])
+        if duration <= BREAKOUT_LOOKBACK:
+            # RSI darf seit Ausbruchsbeginn noch NICHT die Schwelle erreicht haben –
+            # sonst wäre das Signal schon einmal gesendet worden (verhindert Dauerfeuer).
+            rsi_already_confirmed = any(
+                df.iloc[k]["rsi"] >= RSI_BREAKOUT_HIGH for k in range(breakout_start, current_pos)
+            )
+            if not rsi_already_confirmed and rsi >= RSI_BREAKOUT_HIGH:
+                sl = close - SL_BUFFER * 2  # weiterer Puffer, da Breakouts volatiler sind
+                return build_signal("BUY", "BREAKOUT", close, sl, rsi, candle["close_time"])
+
+    # --- SELL-Breakout: Kurs liegt (seit kurzem) unter dem unteren Band, im Abwärtstrend ---
+    if close < ema200 and close < bb_lower and is_red:
+        breakout_start = _find_breakout_start(df, current_pos, "bb_lower", lambda c, b: c < b)
+        duration = current_pos - breakout_start
+
+        if duration <= BREAKOUT_LOOKBACK:
+            rsi_already_confirmed = any(
+                df.iloc[k]["rsi"] <= RSI_BREAKOUT_LOW for k in range(breakout_start, current_pos)
+            )
+            if not rsi_already_confirmed and rsi <= RSI_BREAKOUT_LOW:
+                sl = close + SL_BUFFER * 2
+                return build_signal("SELL", "BREAKOUT", close, sl, rsi, candle["close_time"])
 
     return None
 

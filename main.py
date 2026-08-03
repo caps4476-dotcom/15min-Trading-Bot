@@ -307,6 +307,16 @@ def process_symbol_timeframe(symbol: str, interval: str, state: dict) -> bool:
 
     signals = [s for s in (check_retest_signal(df), check_breakout_signal(df)) if s is not None]
 
+    # Detailliertes Debug-Log der letzten ABGESCHLOSSENEN Kerze (iloc[-2]) –
+    # damit sich spätere "hätte das nicht ein Signal geben müssen?"-Fälle im
+    # Actions-Log direkt anhand der tatsächlichen Zahlen nachvollziehen lassen.
+    last = df.iloc[-2]
+    logger.info(
+        f"{symbol} {interval} | close={last['close']:.2f} ema200={last['ema200']:.2f} "
+        f"bb_upper={last['bb_upper']:.2f} bb_lower={last['bb_lower']:.2f} rsi={last['rsi']:.2f} "
+        f"| Kerzenzeit={last['close_time']}"
+    )
+
     if not signals:
         logger.info(f"{symbol} {interval}: keine Signal-Bedingung erfüllt.")
         return False

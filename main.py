@@ -43,7 +43,14 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SYMBOLS = ["BTCUSDT", "PAXGUSDT", "EURUSDT"]  # PAXGUSDT = Gold, EURUSDT = EUR/USD
 TIMEFRAMES = ["15m", "5m"]
 
-BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+# Mehrere Basis-URLs für die Kerzendaten: Binance blockiert seine Haupt-API teils
+# nach Region (Fehler 451), z. B. wenn GitHub Actions zufällig einen US-Server zieht.
+# data-api.binance.vision ist Binance's eigene, separate Domain nur für öffentliche
+# Marktdaten und davon in der Regel nicht betroffen – wird deshalb zuerst versucht.
+BINANCE_KLINES_URLS = [
+    "https://data-api.binance.vision/api/v3/klines",
+    "https://api.binance.com/api/v3/klines",
+]
 CANDLE_LIMIT = 300  # genug Historie für EMA200
 
 EMA_PERIOD = 200
@@ -75,11 +82,23 @@ logger = logging.getLogger("m15_signal_bot")
 # ---------------------------------------------------------------------------
 
 def fetch_klines(symbol: str, interval: str, limit: int = CANDLE_LIMIT) -> pd.DataFrame:
-    """Holt die letzten Kerzen von der öffentlichen Binance-REST-API."""
+    """Holt die letzten Kerzen von der öffentlichen Binance-REST-API.
+    Probiert dabei mehrere Basis-URLs durch, falls eine davon (z. B. wegen
+    regionaler Sperrung, Fehler 451) nicht erreichbar ist."""
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    resp = requests.get(BINANCE_KLINES_URL, params=params, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
+    last_error = None
+
+    for base_url in BINANCE_KLINES_URLS:
+        try:
+            resp = requests.get(base_url, params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except requests.RequestException as e:
+            last_error = e
+            logger.warning(f"Kline-Abruf über {base_url} fehlgeschlagen ({e}), versuche nächste URL.")
+    else:
+        raise last_error
 
     df = pd.DataFrame(data, columns=[
         "open_time", "open", "high", "low", "close", "volume",

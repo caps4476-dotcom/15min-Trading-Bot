@@ -68,6 +68,8 @@ RSI_BREAKOUT_LOW = 40   # Breakout SELL: RSI muss höchstens so niedrig sein
 BREAKOUT_LOOKBACK = 5   # Wie viele Kerzen nach dem eigentlichen Ausbruch die RSI-Bestätigung noch zählt
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_signal.json")
+OPEN_TRADES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "open_trades.json")
+TRADE_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trade_history.json")
 RETRY_SLEEP_SECONDS = 60  # Wartezeit nach einem Fehler, bevor erneut versucht wird
 
 logging.basicConfig(
@@ -252,19 +254,101 @@ def check_breakout_signal(df: pd.DataFrame):
 # Duplikat-Schutz (State-Datei)
 # ---------------------------------------------------------------------------
 
-def load_state() -> dict:
-    if not os.path.exists(STATE_FILE):
+def _load_json(path: str) -> dict:
+    if not os.path.exists(path):
         return {}
     try:
-        with open(STATE_FILE, "r") as f:
+        with open(path, "r") as f:
             return json.load(f)
     except (json.JSONDecodeError, OSError):
         return {}
 
 
+def _save_json(path: str, data: dict):
+    with open(path, "w") as f:
+        json.dump(data, f)
+
+
+def load_state() -> dict:
+    return _load_json(STATE_FILE)
+
+
 def save_state(state: dict):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
+    _save_json(STATE_FILE, state)
+
+
+def load_open_trades() -> dict:
+    return _load_json(OPEN_TRADES_FILE)
+
+
+def save_open_trades(trades: dict):
+    _save_json(OPEN_TRADES_FILE, trades)
+
+
+def append_trade_history(entry: dict):
+    history = _load_json(TRADE_HISTORY_FILE)
+    entries = history.get("entries", [])
+    entries.append(entry)
+    _save_json(TRADE_HISTORY_FILE, {"entries": entries})
+
+
+# ---------------------------------------------------------------------------
+# Offene Trades verfolgen (TP/SL-Ergebnis)
+# ---------------------------------------------------------------------------
+
+def check_open_trades_for_symbol(symbol: str, interval: str, df: pd.DataFrame, open_trades: dict) -> bool:
+    """Prüft alle offenen Trades dieses Symbol/Timeframe gegen die Kerzen SEIT
+    Trade-Eröffnung. Sendet bei TP/SL-Treffer eine Ergebnis-Nachricht und
+    entfernt den Trade aus den offenen Positionen. Gibt True zurück bei Änderung."""
+    changed = False
+    key_prefix = f"{symbol}_{interval}_"
+    relevant_ids = [tid for tid in open_trades if tid.startswith(key_prefix)]
+
+    for trade_id in relevant_ids:
+        trade = open_trades[trade_id]
+        opened_at = pd.Timestamp(trade["candle_time"])
+
+        # Nur Kerzen NACH der Signal-Kerze zählen (die Signal-Kerze selbst war der Einstieg).
+        subsequent = df[df["close_time"] > opened_at]
+        if subsequent.empty:
+            continue
+
+        outcome = None
+        exit_price = None
+
+        for _, candle in subsequent.iterrows():
+            if trade["type"] == "BUY":
+                hit_sl = candle["low"] <= trade["sl"]
+                hit_tp = candle["high"] >= trade["tp"]
+            else:  # SELL
+                hit_sl = candle["high"] >= trade["sl"]
+                hit_tp = candle["low"] <= trade["tp"]
+
+            if hit_sl and hit_tp:
+                # Beides in derselben Kerze getroffen – nicht eindeutig, welches zuerst
+                # geschah. Wir gehen konservativ vom schlechteren Fall (SL) aus.
+                outcome, exit_price = "SL", trade["sl"]
+                break
+            elif hit_sl:
+                outcome, exit_price = "SL", trade["sl"]
+                break
+            elif hit_tp:
+                outcome, exit_price = "TP", trade["tp"]
+                break
+
+        if outcome is None:
+            continue  # Trade noch offen, weder TP noch SL erreicht
+
+        message = format_outcome_message(trade, outcome, exit_price)
+        if send_telegram_message(message):
+            logger.info(f"Trade abgeschlossen: {trade_id} -> {outcome} @ {exit_price}")
+            append_trade_history({**trade, "outcome": outcome, "exit_price": exit_price})
+            del open_trades[trade_id]
+            changed = True
+        else:
+            logger.warning(f"Trade-Ergebnis erkannt ({trade_id} -> {outcome}), aber Telegram-Versand fehlgeschlagen.")
+
+    return changed
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +371,27 @@ def format_signal_message(symbol: str, interval: str, signal: dict) -> str:
         f"- *CRV:* 1:{CRV}\n"
         f"- *RSI:* {signal['rsi']:.2f}\n"
         f"- *Grund:* {reason}"
+    )
+
+
+def format_outcome_message(trade: dict, outcome: str, exit_price: float) -> str:
+    display_symbol = trade["symbol"].replace("USDT", "USD")
+    category_label = "Re-Test" if trade["category"] == "RETEST" else "Breakout"
+
+    if outcome == "TP":
+        emoji = "✅"
+        title = "TAKE PROFIT ERREICHT"
+        pnl = (exit_price - trade["entry"]) if trade["type"] == "BUY" else (trade["entry"] - exit_price)
+    else:
+        emoji = "❌"
+        title = "STOP LOSS ERREICHT"
+        pnl = (exit_price - trade["entry"]) if trade["type"] == "BUY" else (trade["entry"] - exit_price)
+
+    return (
+        f"{emoji} *{title} - {trade['interval'].upper()} {trade['type']} ({category_label}) - {display_symbol}* {emoji}\n\n"
+        f"- *Einstieg:* {trade['entry']:.2f} $\n"
+        f"- *Ausstieg:* {exit_price:.2f} $\n"
+        f"- *Ergebnis:* {'+' if pnl >= 0 else ''}{pnl:.2f} $"
     )
 
 
@@ -314,15 +419,20 @@ def send_telegram_message(text: str) -> bool:
 # Ablaufsteuerung
 # ---------------------------------------------------------------------------
 
-def process_symbol_timeframe(symbol: str, interval: str, state: dict) -> bool:
-    """Prüft ein Symbol/Timeframe auf beide Signal-Typen. Gibt True zurück, wenn der State geändert wurde."""
-    state_changed = False
+def process_symbol_timeframe(symbol: str, interval: str, state: dict, open_trades: dict) -> bool:
+    """Prüft ein Symbol/Timeframe auf beide Signal-Typen UND auf TP/SL-Ergebnisse
+    offener Trades. Gibt True zurück, wenn state oder open_trades geändert wurden."""
+    changed = False
     try:
         df = fetch_klines(symbol, interval)
         df = calculate_indicators(df)
     except requests.RequestException as e:
         logger.error(f"Netzwerkfehler beim Abruf von {symbol} {interval}: {e}")
         return False
+
+    # Zuerst offene Trades gegen die aktuellen Kerzen prüfen (TP/SL-Ergebnis).
+    if check_open_trades_for_symbol(symbol, interval, df, open_trades):
+        changed = True
 
     signals = [s for s in (check_retest_signal(df), check_breakout_signal(df)) if s is not None]
 
@@ -338,7 +448,7 @@ def process_symbol_timeframe(symbol: str, interval: str, state: dict) -> bool:
 
     if not signals:
         logger.info(f"{symbol} {interval}: keine Signal-Bedingung erfüllt.")
-        return False
+        return changed
 
     for signal in signals:
         state_key = f"{symbol}_{interval}_{signal['category']}"
@@ -351,25 +461,44 @@ def process_symbol_timeframe(symbol: str, interval: str, state: dict) -> bool:
         message = format_signal_message(symbol, interval, signal)
         if send_telegram_message(message):
             state[state_key] = candle_time_str
-            state_changed = True
+            changed = True
             logger.info(f"Signal gesendet: {symbol} {interval} {signal['category']} {signal['type']} @ {signal['entry']:.2f}")
+
+            # Als offenen Trade speichern, damit TP/SL künftig verfolgt werden.
+            trade_id = f"{symbol}_{interval}_{signal['category']}_{candle_time_str}"
+            open_trades[trade_id] = {
+                "symbol": symbol,
+                "interval": interval,
+                "category": signal["category"],
+                "type": signal["type"],
+                "entry": signal["entry"],
+                "sl": signal["sl"],
+                "tp": signal["tp"],
+                "rsi": signal["rsi"],
+                "candle_time": candle_time_str,
+            }
         else:
             logger.warning(f"Signal erkannt ({symbol} {interval} {signal['category']}), aber Telegram-Versand fehlgeschlagen.")
 
-    return state_changed
+    return changed
 
 
 def run_check():
     state = load_state()
+    open_trades = load_open_trades()
     state_changed = False
+    trades_changed = False
 
     for symbol in SYMBOLS:
         for interval in TIMEFRAMES:
-            if process_symbol_timeframe(symbol, interval, state):
+            if process_symbol_timeframe(symbol, interval, state, open_trades):
                 state_changed = True
+                trades_changed = True
 
     if state_changed:
         save_state(state)
+    if trades_changed:
+        save_open_trades(open_trades)
 
 
 def seconds_until_next_check() -> float:

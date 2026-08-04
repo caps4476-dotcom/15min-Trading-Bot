@@ -58,7 +58,9 @@ BB_LENGTH = 20
 BB_STD = 2.0
 RSI_PERIOD = 14
 
-SL_BUFFER_PCT = 0.001   # 0.1% des Kurses Puffer für Re-Test (skaliert automatisch mit dem Preisniveau)
+ATR_PERIOD = 14          # Anzahl Kerzen für die ATR-Berechnung (Standard: 14)
+SL_RETEST_ATR_MULT = 1.5    # SL-Abstand beim Re-Test = 1,5x ATR
+SL_BREAKOUT_ATR_MULT = 2.0  # SL-Abstand beim Breakout = 2x ATR (etwas mehr Puffer, da volatiler)
 CRV = 1.5           # Chance-Risiko-Verhältnis für den Take Profit
 
 RSI_RETEST_HIGH = 60   # Re-Test SELL: RSI muss mindestens so hoch sein
@@ -115,7 +117,7 @@ def fetch_klines(symbol: str, interval: str, limit: int = CANDLE_LIMIT) -> pd.Da
 
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Berechnet EMA200, Bollinger Bänder (20, 2.0) und RSI(14)."""
+    """Berechnet EMA200, Bollinger Bänder (20, 2.0), RSI(14) und ATR(14)."""
     df = df.copy()
 
     df["ema200"] = df["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
@@ -134,6 +136,17 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     rs = avg_gain / avg_loss.replace(0, np.nan)
     df["rsi"] = 100 - (100 / (1 + rs))
     df["rsi"] = df["rsi"].fillna(50)
+
+    # ATR (Average True Range) – misst die durchschnittliche Kerzen-Schwankungsbreite
+    # der letzten ATR_PERIOD Kerzen. Skaliert SL/TP automatisch an die tatsächliche
+    # Volatilität jedes Assets/Timeframes, statt eines starren Prozentsatzes.
+    prev_close = df["close"].shift(1)
+    true_range = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev_close).abs(),
+        (df["low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    df["atr"] = true_range.rolling(ATR_PERIOD).mean()
 
     return df
 
@@ -170,9 +183,11 @@ def check_retest_signal(df: pd.DataFrame):
 
     candle = df.iloc[-2]
     close, open_, high, low = candle["close"], candle["open"], candle["high"], candle["low"]
-    ema200, bb_upper, bb_lower, rsi = candle["ema200"], candle["bb_upper"], candle["bb_lower"], candle["rsi"]
+    ema200, bb_upper, bb_lower, rsi, atr = (
+        candle["ema200"], candle["bb_upper"], candle["bb_lower"], candle["rsi"], candle["atr"]
+    )
 
-    if any(pd.isna(x) for x in [ema200, bb_upper, bb_lower, rsi]):
+    if any(pd.isna(x) for x in [ema200, bb_upper, bb_lower, rsi, atr]):
         return None
 
     is_red = close < open_
@@ -180,12 +195,12 @@ def check_retest_signal(df: pd.DataFrame):
 
     # SELL: Abwärtstrend, Hoch berührt oberes Band, schließt wieder darunter (Ablehnung)
     if close < ema200 and high >= bb_upper and close < bb_upper and is_red and rsi >= RSI_RETEST_HIGH:
-        sl = high + high * SL_BUFFER_PCT
+        sl = close + atr * SL_RETEST_ATR_MULT
         return build_signal("SELL", "RETEST", close, sl, rsi, candle["close_time"])
 
     # BUY: Aufwärtstrend, Tief berührt unteres Band, schließt wieder darüber (Bounce)
     if close > ema200 and low <= bb_lower and close > bb_lower and is_green and rsi <= RSI_RETEST_LOW:
-        sl = low - low * SL_BUFFER_PCT
+        sl = close - atr * SL_RETEST_ATR_MULT
         return build_signal("BUY", "RETEST", close, sl, rsi, candle["close_time"])
 
     return None
@@ -212,9 +227,11 @@ def check_breakout_signal(df: pd.DataFrame):
     candle = df.iloc[current_pos]
 
     close, open_ = candle["close"], candle["open"]
-    ema200, bb_upper, bb_lower, rsi = candle["ema200"], candle["bb_upper"], candle["bb_lower"], candle["rsi"]
+    ema200, bb_upper, bb_lower, rsi, atr = (
+        candle["ema200"], candle["bb_upper"], candle["bb_lower"], candle["rsi"], candle["atr"]
+    )
 
-    if any(pd.isna(x) for x in [ema200, bb_upper, bb_lower, rsi]):
+    if any(pd.isna(x) for x in [ema200, bb_upper, bb_lower, rsi, atr]):
         return None
 
     # --- BUY-Breakout: Kurs liegt (seit kurzem) über dem oberen Band, im Aufwärtstrend ---
@@ -231,7 +248,7 @@ def check_breakout_signal(df: pd.DataFrame):
                 df.iloc[k]["rsi"] >= RSI_BREAKOUT_HIGH for k in range(breakout_start, current_pos)
             )
             if not rsi_already_confirmed and rsi >= RSI_BREAKOUT_HIGH:
-                sl = close - close * SL_BUFFER_PCT * 2  # weiterer Puffer, da Breakouts volatiler sind
+                sl = close - atr * SL_BREAKOUT_ATR_MULT
                 return build_signal("BUY", "BREAKOUT", close, sl, rsi, candle["close_time"])
 
     # --- SELL-Breakout: Kurs liegt (seit kurzem) unter dem unteren Band, im Abwärtstrend ---
@@ -244,7 +261,7 @@ def check_breakout_signal(df: pd.DataFrame):
                 df.iloc[k]["rsi"] <= RSI_BREAKOUT_LOW for k in range(breakout_start, current_pos)
             )
             if not rsi_already_confirmed and rsi <= RSI_BREAKOUT_LOW:
-                sl = close + close * SL_BUFFER_PCT * 2
+                sl = close + atr * SL_BREAKOUT_ATR_MULT
                 return build_signal("SELL", "BREAKOUT", close, sl, rsi, candle["close_time"])
 
     return None
@@ -454,9 +471,9 @@ def process_symbol_timeframe(symbol: str, interval: str, state: dict, open_trade
     # Actions-Log direkt anhand der tatsächlichen Zahlen nachvollziehen lassen.
     last = df.iloc[-2]
     logger.info(
-        f"{symbol} {interval} | close={last['close']:.2f} ema200={last['ema200']:.2f} "
-        f"bb_upper={last['bb_upper']:.2f} bb_lower={last['bb_lower']:.2f} rsi={last['rsi']:.2f} "
-        f"| Kerzenzeit={last['close_time']}"
+        f"{symbol} {interval} | close={last['close']:.5f} ema200={last['ema200']:.5f} "
+        f"bb_upper={last['bb_upper']:.5f} bb_lower={last['bb_lower']:.5f} rsi={last['rsi']:.2f} "
+        f"atr={last['atr']:.5f} | Kerzenzeit={last['close_time']}"
     )
 
     if not signals:

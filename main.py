@@ -212,9 +212,14 @@ def check_retest_signal(df: pd.DataFrame):
 
 def _find_breakout_start(df: pd.DataFrame, current_pos: int, band_col: str, is_outside) -> int:
     """Läuft von der aktuellen Kerze rückwärts, solange der Kurs durchgehend außerhalb
-    des Bandes liegt, und gibt die Position der ERSTEN Kerze dieses Ausbruchs zurück."""
+    des Bandes liegt, und gibt die Position der ERSTEN Kerze dieses Ausbruchs zurück.
+    Bricht spätestens nach BREAKOUT_LOOKBACK+1 Schritten ab – das genügt, weil ein
+    länger zurückliegender Ausbruch ohnehin nicht mehr als "aktuell" zählt (siehe
+    BREAKOUT_LOOKBACK-Prüfung beim Aufruf). Das hält die Funktion auch bei sehr
+    langer Kerzen-Historie (z. B. im Backtest) schnell."""
     pos = current_pos
-    while pos > 0 and is_outside(df.iloc[pos - 1]["close"], df.iloc[pos - 1][band_col]):
+    min_pos = max(0, current_pos - BREAKOUT_LOOKBACK - 1)
+    while pos > min_pos and is_outside(df.iloc[pos - 1]["close"], df.iloc[pos - 1][band_col]):
         pos -= 1
     return pos
 

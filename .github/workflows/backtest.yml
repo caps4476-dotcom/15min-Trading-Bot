@@ -1,0 +1,35 @@
+name: Backtest
+
+on:
+  workflow_dispatch: {}   # nur manuell über "Run workflow" startbar, kein Zeitplan
+
+permissions:
+  contents: write   # nötig, damit backtest_report.md zurück ins Repo committet werden darf
+
+jobs:
+  run-backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repo auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Abhängigkeiten installieren
+        run: pip install -r requirements.txt
+
+      - name: Backtest ausführen
+        run: python backtest.py
+
+      - name: Report zurückspeichern
+        run: |
+          if [ -n "$(git status --porcelain backtest_report.md)" ]; then
+            git config user.name "m15-signal-bot"
+            git config user.email "actions@github.com"
+            git add backtest_report.md
+            git commit -m "Update backtest_report.md [skip ci]"
+            git push
+          fi

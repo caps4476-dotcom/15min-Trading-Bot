@@ -43,6 +43,12 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SYMBOLS = ["BTCUSDT", "PAXGUSDT", "EURUSDT"]  # PAXGUSDT = Gold, EURUSDT = EUR/USD
 TIMEFRAMES = ["15m", "5m"]
 
+# Welche Signal-Kategorien aktiv geprüft/gesendet werden sollen.
+# Per Backtest (60 Tage, 3.058 Trades) deaktiviert: BREAKOUT lief mit -17,19% klar
+# negativ, RETEST dagegen mit +3,01% positiv. Breakout-Logik bleibt im Code
+# erhalten, falls sie später (z. B. nach weiteren Anpassungen) reaktiviert wird.
+ENABLED_CATEGORIES = ["RETEST"]  # Optionen: "RETEST", "BREAKOUT"
+
 # Mehrere Basis-URLs für die Kerzendaten: Binance blockiert seine Haupt-API teils
 # nach Region (Fehler 451), z. B. wenn GitHub Actions zufällig einen US-Server zieht.
 # data-api.binance.vision ist Binance's eigene, separate Domain nur für öffentliche
@@ -469,7 +475,12 @@ def process_symbol_timeframe(symbol: str, interval: str, state: dict, open_trade
     if check_open_trades_for_symbol(symbol, interval, df, open_trades):
         changed = True
 
-    signals = [s for s in (check_retest_signal(df), check_breakout_signal(df)) if s is not None]
+    possible_signals = []
+    if "RETEST" in ENABLED_CATEGORIES:
+        possible_signals.append(check_retest_signal(df))
+    if "BREAKOUT" in ENABLED_CATEGORIES:
+        possible_signals.append(check_breakout_signal(df))
+    signals = [s for s in possible_signals if s is not None]
 
     # Detailliertes Debug-Log der letzten ABGESCHLOSSENEN Kerze (iloc[-2]) –
     # damit sich spätere "hätte das nicht ein Signal geben müssen?"-Fälle im

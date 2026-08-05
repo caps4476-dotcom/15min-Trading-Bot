@@ -18,7 +18,7 @@ import pandas as pd
 from main import (
     SYMBOLS, TIMEFRAMES, BINANCE_KLINES_URLS,
     EMA_PERIOD, BREAKOUT_LOOKBACK, CRV,
-    calculate_indicators, check_retest_signal, check_breakout_signal,
+    calculate_indicators, check_retest_signal, check_breakout_signal, check_momentum_signal,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -92,7 +92,13 @@ def simulate(df: pd.DataFrame) -> list:
     for i in range(start_i, len(df) - 1):
         window = df.iloc[:i + 2]  # so dass window.iloc[-2] == df.iloc[i]
 
-        for check_fn, category in [(check_retest_signal, "RETEST"), (check_breakout_signal, "BREAKOUT")]:
+        checks = [
+            (check_retest_signal, "RETEST"),
+            (check_breakout_signal, "BREAKOUT"),
+            (lambda w: check_momentum_signal(w, require_pattern=False), "MOMENTUM"),
+            (lambda w: check_momentum_signal(w, require_pattern=True), "MOMENTUM_PATTERN"),
+        ]
+        for check_fn, category in checks:
             signal = check_fn(window)
             if signal is None:
                 continue
@@ -185,7 +191,7 @@ def main():
             trades = simulate(df)
             logger.info(f"{symbol} {interval}: {len(trades)} Signale gefunden in {len(df)} Kerzen.")
 
-            for category in ("RETEST", "BREAKOUT"):
+            for category in ("RETEST", "BREAKOUT", "MOMENTUM", "MOMENTUM_PATTERN"):
                 cat_trades = [t for t in trades if t["category"] == category]
                 if not cat_trades:
                     continue

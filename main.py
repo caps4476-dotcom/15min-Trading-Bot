@@ -47,7 +47,7 @@ TIMEFRAMES = ["15m", "5m"]
 # Per Backtest (60 Tage, 3.058 Trades) deaktiviert: BREAKOUT lief mit -17,19% klar
 # negativ, RETEST dagegen mit +3,01% positiv. Breakout-Logik bleibt im Code
 # erhalten, falls sie später (z. B. nach weiteren Anpassungen) reaktiviert wird.
-ENABLED_CATEGORIES = ["RETEST"]  # Optionen: "RETEST", "BREAKOUT"
+ENABLED_CATEGORIES = ["RETEST"]  # Optionen: "RETEST", "BREAKOUT", "MOMENTUM"
 
 # Mehrere Basis-URLs für die Kerzendaten: Binance blockiert seine Haupt-API teils
 # nach Region (Fehler 451), z. B. wenn GitHub Actions zufällig einen US-Server zieht.
@@ -74,6 +74,15 @@ RSI_RETEST_LOW = 40    # Re-Test BUY: RSI muss höchstens so niedrig sein
 RSI_BREAKOUT_HIGH = 60  # Breakout BUY: RSI muss mindestens so hoch sein
 RSI_BREAKOUT_LOW = 40   # Breakout SELL: RSI muss höchstens so niedrig sein
 BREAKOUT_LOOKBACK = 5   # Wie viele Kerzen nach dem eigentlichen Ausbruch die RSI-Bestätigung noch zählt
+
+# --- Momentum-Strategie (aggressiver, EMA-Crossover statt Band-Berührung) ---
+# Bewusst NOCH NICHT live (siehe ENABLED_CATEGORIES oben) – erst per Backtest
+# bewerten, bevor überhaupt eine Nachricht verschickt wird.
+EMA_FAST_PERIOD = 9
+EMA_SLOW_PERIOD = 21
+RSI_MOMENTUM_HIGH = 55  # lockerer als Re-Test (60), da Momentum früher einsteigen will
+RSI_MOMENTUM_LOW = 45
+MOMENTUM_REQUIRE_PATTERN = False  # True = zusätzlich Kerzenmuster-Bestätigung nötig
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_signal.json")
 OPEN_TRADES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "open_trades.json")
@@ -127,6 +136,8 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     df["ema200"] = df["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
+    df["ema_fast"] = df["close"].ewm(span=EMA_FAST_PERIOD, adjust=False).mean()
+    df["ema_slow"] = df["close"].ewm(span=EMA_SLOW_PERIOD, adjust=False).mean()
 
     sma = df["close"].rolling(BB_LENGTH).mean()
     std = df["close"].rolling(BB_LENGTH).std(ddof=0)
@@ -279,6 +290,82 @@ def check_breakout_signal(df: pd.DataFrame):
 
 
 # ---------------------------------------------------------------------------
+# Kerzenmuster-Erkennung (für die optionale Momentum-Bestätigung)
+# ---------------------------------------------------------------------------
+
+def _is_bullish_engulfing(prev: pd.Series, curr: pd.Series) -> bool:
+    prev_red = prev["close"] < prev["open"]
+    curr_green = curr["close"] > curr["open"]
+    engulfs = curr["open"] <= prev["close"] and curr["close"] >= prev["open"]
+    return prev_red and curr_green and engulfs
+
+
+def _is_bearish_engulfing(prev: pd.Series, curr: pd.Series) -> bool:
+    prev_green = prev["close"] > prev["open"]
+    curr_red = curr["close"] < curr["open"]
+    engulfs = curr["open"] >= prev["close"] and curr["close"] <= prev["open"]
+    return prev_green and curr_red and engulfs
+
+
+def _is_hammer(candle: pd.Series) -> bool:
+    body = abs(candle["close"] - candle["open"])
+    if body == 0:
+        return False
+    lower_wick = min(candle["open"], candle["close"]) - candle["low"]
+    upper_wick = candle["high"] - max(candle["open"], candle["close"])
+    return lower_wick >= body * 2 and upper_wick <= body * 0.5
+
+
+def _is_shooting_star(candle: pd.Series) -> bool:
+    body = abs(candle["close"] - candle["open"])
+    if body == 0:
+        return False
+    upper_wick = candle["high"] - max(candle["open"], candle["close"])
+    lower_wick = min(candle["open"], candle["close"]) - candle["low"]
+    return upper_wick >= body * 2 and lower_wick <= body * 0.5
+
+
+# ---------------------------------------------------------------------------
+# Signal-Logik: MOMENTUM (EMA-Crossover, aggressiver als Re-Test)
+# ---------------------------------------------------------------------------
+
+def check_momentum_signal(df: pd.DataFrame, require_pattern: bool = MOMENTUM_REQUIRE_PATTERN):
+    if len(df) < EMA_PERIOD + 5:
+        return None
+
+    current_pos = len(df) - 2
+    candle = df.iloc[current_pos]
+    prev = df.iloc[current_pos - 1]
+
+    close, ema200, ema_fast, ema_slow, rsi, atr = (
+        candle["close"], candle["ema200"], candle["ema_fast"], candle["ema_slow"], candle["rsi"], candle["atr"]
+    )
+    prev_fast, prev_slow = prev["ema_fast"], prev["ema_slow"]
+
+    if any(pd.isna(x) for x in [ema200, ema_fast, ema_slow, rsi, atr, prev_fast, prev_slow]):
+        return None
+
+    bullish_cross = prev_fast <= prev_slow and ema_fast > ema_slow
+    bearish_cross = prev_fast >= prev_slow and ema_fast < ema_slow
+
+    # BUY: EMA9 kreuzt EMA21 von unten nach oben, im Aufwärtstrend, RSI zeigt Stärke
+    if bullish_cross and close > ema200 and rsi >= RSI_MOMENTUM_HIGH:
+        if require_pattern and not (_is_bullish_engulfing(prev, candle) or _is_hammer(candle)):
+            return None
+        sl = close - atr * SL_RETEST_ATR_MULT
+        return build_signal("BUY", "MOMENTUM", close, sl, rsi, candle["close_time"])
+
+    # SELL: EMA9 kreuzt EMA21 von oben nach unten, im Abwärtstrend, RSI zeigt Schwäche
+    if bearish_cross and close < ema200 and rsi <= RSI_MOMENTUM_LOW:
+        if require_pattern and not (_is_bearish_engulfing(prev, candle) or _is_shooting_star(candle)):
+            return None
+        sl = close + atr * SL_RETEST_ATR_MULT
+        return build_signal("SELL", "MOMENTUM", close, sl, rsi, candle["close_time"])
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Duplikat-Schutz (State-Datei)
 # ---------------------------------------------------------------------------
 
@@ -394,12 +481,17 @@ def _decimals_for_price(price: float) -> int:
     return 2
 
 
+CATEGORY_LABELS = {"RETEST": "Re-Test", "BREAKOUT": "Breakout", "MOMENTUM": "Momentum"}
+CATEGORY_REASONS = {
+    "RETEST": "Abprall/Ablehnung am Bollinger Band im Trend des EMA 200",
+    "BREAKOUT": "Ausbruch durchs Bollinger Band mit Trendbestätigung (EMA 200 + starker RSI)",
+    "MOMENTUM": "EMA9/EMA21-Crossover im Trend des EMA 200 mit RSI-Bestätigung",
+}
+
+
 def format_signal_message(symbol: str, interval: str, signal: dict) -> str:
-    category_label = "Re-Test" if signal["category"] == "RETEST" else "Breakout"
-    if signal["category"] == "RETEST":
-        reason = "Abprall/Ablehnung am Bollinger Band im Trend des EMA 200"
-    else:
-        reason = "Ausbruch durchs Bollinger Band mit Trendbestätigung (EMA 200 + starker RSI)"
+    category_label = CATEGORY_LABELS.get(signal["category"], signal["category"])
+    reason = CATEGORY_REASONS.get(signal["category"], "")
 
     display_symbol = symbol.replace("USDT", "USD")
     d = _decimals_for_price(signal["entry"])
@@ -416,7 +508,7 @@ def format_signal_message(symbol: str, interval: str, signal: dict) -> str:
 
 def format_outcome_message(trade: dict, outcome: str, exit_price: float) -> str:
     display_symbol = trade["symbol"].replace("USDT", "USD")
-    category_label = "Re-Test" if trade["category"] == "RETEST" else "Breakout"
+    category_label = CATEGORY_LABELS.get(trade["category"], trade["category"])
     d = _decimals_for_price(trade["entry"])
 
     if outcome == "TP":
@@ -480,6 +572,8 @@ def process_symbol_timeframe(symbol: str, interval: str, state: dict, open_trade
         possible_signals.append(check_retest_signal(df))
     if "BREAKOUT" in ENABLED_CATEGORIES:
         possible_signals.append(check_breakout_signal(df))
+    if "MOMENTUM" in ENABLED_CATEGORIES:
+        possible_signals.append(check_momentum_signal(df))
     signals = [s for s in possible_signals if s is not None]
 
     # Detailliertes Debug-Log der letzten ABGESCHLOSSENEN Kerze (iloc[-2]) –

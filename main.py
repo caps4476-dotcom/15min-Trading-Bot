@@ -43,11 +43,16 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SYMBOLS = ["BTCUSDT", "PAXGUSDT", "EURUSDT"]  # PAXGUSDT = Gold, EURUSDT = EUR/USD
 TIMEFRAMES = ["15m", "5m"]
 
-# Welche Signal-Kategorien aktiv geprüft/gesendet werden sollen.
-# Per Backtest (60 Tage, 3.058 Trades) deaktiviert: BREAKOUT lief mit -17,19% klar
-# negativ, RETEST dagegen mit +3,01% positiv. Breakout-Logik bleibt im Code
-# erhalten, falls sie später (z. B. nach weiteren Anpassungen) reaktiviert wird.
-ENABLED_CATEGORIES = ["RETEST"]  # Optionen: "RETEST", "BREAKOUT", "MOMENTUM"
+# Welche Signal-Kategorien pro Symbol aktiv geprüft/gesendet werden.
+# Per Backtest (60 Tage): BREAKOUT lief für alle Assets klar negativ -> überall aus.
+# MOMENTUM lief nur für BTC konsistent positiv (M15 +5,09%, M5 +2,12%), für
+# Gold/EUR-USD dagegen negativ/gemischt -> deshalb nur für BTC aktiviert.
+# Alle Signal-Funktionen bleiben im Code erhalten, falls spätere Backtests ein
+# anderes Bild zeigen.
+DEFAULT_ENABLED_CATEGORIES = ["RETEST"]  # Optionen: "RETEST", "BREAKOUT", "MOMENTUM"
+SYMBOL_CATEGORY_OVERRIDES = {
+    "BTCUSDT": ["RETEST", "MOMENTUM"],
+}
 
 # Mehrere Basis-URLs für die Kerzendaten: Binance blockiert seine Haupt-API teils
 # nach Region (Fehler 451), z. B. wenn GitHub Actions zufällig einen US-Server zieht.
@@ -76,8 +81,8 @@ RSI_BREAKOUT_LOW = 40   # Breakout SELL: RSI muss höchstens so niedrig sein
 BREAKOUT_LOOKBACK = 5   # Wie viele Kerzen nach dem eigentlichen Ausbruch die RSI-Bestätigung noch zählt
 
 # --- Momentum-Strategie (aggressiver, EMA-Crossover statt Band-Berührung) ---
-# Bewusst NOCH NICHT live (siehe ENABLED_CATEGORIES oben) – erst per Backtest
-# bewerten, bevor überhaupt eine Nachricht verschickt wird.
+# Per Backtest nur für BTC konsistent positiv -> siehe SYMBOL_CATEGORY_OVERRIDES
+# oben. Für Gold/EUR-USD bleibt Momentum vorerst deaktiviert.
 EMA_FAST_PERIOD = 9
 EMA_SLOW_PERIOD = 21
 RSI_MOMENTUM_HIGH = 55  # lockerer als Re-Test (60), da Momentum früher einsteigen will
@@ -567,12 +572,13 @@ def process_symbol_timeframe(symbol: str, interval: str, state: dict, open_trade
     if check_open_trades_for_symbol(symbol, interval, df, open_trades):
         changed = True
 
+    enabled_categories = SYMBOL_CATEGORY_OVERRIDES.get(symbol, DEFAULT_ENABLED_CATEGORIES)
     possible_signals = []
-    if "RETEST" in ENABLED_CATEGORIES:
+    if "RETEST" in enabled_categories:
         possible_signals.append(check_retest_signal(df))
-    if "BREAKOUT" in ENABLED_CATEGORIES:
+    if "BREAKOUT" in enabled_categories:
         possible_signals.append(check_breakout_signal(df))
-    if "MOMENTUM" in ENABLED_CATEGORIES:
+    if "MOMENTUM" in enabled_categories:
         possible_signals.append(check_momentum_signal(df))
     signals = [s for s in possible_signals if s is not None]
 

@@ -30,6 +30,8 @@ import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
 
+import binance_demo_trader
+
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -53,6 +55,14 @@ DEFAULT_ENABLED_CATEGORIES = ["RETEST"]  # Optionen: "RETEST", "BREAKOUT", "MOME
 SYMBOL_CATEGORY_OVERRIDES = {
     "BTCUSDT": ["RETEST", "MOMENTUM"],
 }
+
+# Automatische Orderausführung auf Binance Demo Trading (echte Marktdaten,
+# virtuelles Guthaben, kein finanzielles Risiko). Standardmäßig AUS – erst
+# bewusst aktivieren, wenn die Binance-Demo-API-Schlüssel eingerichtet sind
+# (siehe binance_demo_trader.py). AUTO_TRADE_SYMBOLS begrenzt, für welche
+# Symbole automatisch gehandelt wird, selbst wenn AUTO_TRADE_ENABLED an ist.
+AUTO_TRADE_ENABLED = False
+AUTO_TRADE_SYMBOLS = ["BTCUSDT"]
 
 # Mehrere Basis-URLs für die Kerzendaten: Binance blockiert seine Haupt-API teils
 # nach Region (Fehler 451), z. B. wenn GitHub Actions zufällig einen US-Server zieht.
@@ -623,6 +633,15 @@ def process_symbol_timeframe(symbol: str, interval: str, state: dict, open_trade
                 "rsi": signal["rsi"],
                 "candle_time": candle_time_str,
             }
+
+            # Automatische Orderausführung auf Binance Demo Trading, falls aktiviert.
+            if AUTO_TRADE_ENABLED and symbol in AUTO_TRADE_SYMBOLS:
+                auto_traded = binance_demo_trader.place_demo_trade(
+                    symbol, signal["type"], signal["entry"], signal["sl"], signal["tp"]
+                )
+                open_trades[trade_id]["auto_traded"] = auto_traded
+                if not auto_traded:
+                    logger.warning(f"Auto-Trade für {trade_id} fehlgeschlagen – Signal wurde trotzdem gemeldet.")
         else:
             logger.warning(f"Signal erkannt ({symbol} {interval} {signal['category']}), aber Telegram-Versand fehlgeschlagen.")
 
